@@ -37,8 +37,8 @@ public class ProcessedEventStore {
                 return Optional.empty();
             }
             T result = work.get(); // throws -> processed stays false, next delivery retries
-            // Marked after the work: crediting points is the last step that can fail,
-            // so a retry can never double-award.
+            // Marked only after work succeeds, so work must not fail after its side effect,
+            // or a retry would repeat it.
             slot.processed = true;
             return Optional.of(result);
         }
