@@ -45,11 +45,21 @@
       import { renderDashboard } from "./dashboard.js";
 
       // Preview data. The production application would receive the same
-      // shape from PointsResult and MemberAccount.
+      // shape from PointsResult and MemberAccount. Use ?outcome=DUPLICATE or
+      // ?outcome=CAPPED to preview the other states.
+      const previews = {
+        AWARDED: { pointsAwarded: 1500, pointsThisMonth: 82500 },
+        DUPLICATE: { pointsAwarded: 0, pointsThisMonth: 82500 },
+        CAPPED: { pointsAwarded: 0, pointsThisMonth: 100000 },
+      };
+      const requested = new URLSearchParams(location.search).get("outcome");
+      const outcome = Object.hasOwn(previews, requested) ? requested : "AWARDED";
+      const preview = previews[outcome];
+
       renderDashboard(
-        { pointsAwarded: 1500, outcome: "AWARDED" },
+        { pointsAwarded: preview.pointsAwarded, outcome },
         {
-          pointsThisMonth: 82500,
+          pointsThisMonth: preview.pointsThisMonth,
           monthlyCap: 100000,
           streakMonths: 6,
         },
