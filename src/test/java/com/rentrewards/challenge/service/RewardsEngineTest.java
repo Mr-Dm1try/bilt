@@ -14,13 +14,18 @@ import java.time.YearMonth;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class RewardsEngineTest {
@@ -176,6 +181,95 @@ class RewardsEngineTest {
             assertEquals(1500, member.getPointsForMonth(YearMonth.of(2026, 3)));
         } finally {
             executor.shutdownNow();
+        }
+    }
+
+    @Test
+    void retriesAnEventWhoseEarlierAttemptFailed() {
+        AtomicBoolean failNextAttempt = new AtomicBoolean(true);
+        RewardsEngine flakyEngine = new RewardsEngine(new PointsCalculator() {
+            @Override
+            public long calculateBasePoints(PaymentEvent event) {
+                if (failNextAttempt.getAndSet(false)) {
+                    throw new IllegalStateException("simulated processing failure");
+                }
+                return super.calculateBasePoints(event);
+            }
+        }, new ProcessedEventStore());
+        MemberAccount member = new MemberAccount("member-1", 0);
+        PaymentEvent event = new PaymentEvent("evt-1", "member-1",
+                new BigDecimal("1500"), false, LocalDate.of(2026, 3, 1));
+
+        assertThrows(IllegalStateException.class, () -> flakyEngine.processPayment(event, member));
+        PointsResult redelivery = flakyEngine.processPayment(event, member);
+
+        assertEquals(1500, redelivery.getPointsAwarded());
+        assertEquals(ProcessingOutcome.AWARDED, redelivery.getOutcome());
+        assertEquals(1500, member.getPointsForMonth(YearMonth.of(2026, 3)));
+    }
+
+    @Test
+    void waitingDuplicateTakesOverWhenTheInFlightAttemptFails() throws Exception {
+        CountDownLatch firstAttemptStarted = new CountDownLatch(1);
+        CountDownLatch failFirstAttempt = new CountDownLatch(1);
+        AtomicBoolean isFirstAttempt = new AtomicBoolean(true);
+        RewardsEngine slowEngine = new RewardsEngine(new PointsCalculator() {
+            @Override
+            public long calculateBasePoints(PaymentEvent event) {
+                if (isFirstAttempt.getAndSet(false)) {
+                    firstAttemptStarted.countDown();
+                    await(failFirstAttempt);
+                    throw new IllegalStateException("simulated processing failure");
+                }
+                return super.calculateBasePoints(event);
+            }
+        }, new ProcessedEventStore());
+        MemberAccount member = new MemberAccount("member-1", 0);
+        PaymentEvent event = new PaymentEvent("evt-1", "member-1",
+                new BigDecimal("1500"), false, LocalDate.of(2026, 3, 1));
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+
+        try {
+            // The first delivery is mid-processing when the processor redelivers the event.
+            Future<PointsResult> first = executor.submit(() -> slowEngine.processPayment(event, member));
+            assertTrue(firstAttemptStarted.await(2, TimeUnit.SECONDS));
+
+            AtomicReference<Thread> secondWorker = new AtomicReference<>();
+            Future<PointsResult> second = executor.submit(() -> {
+                secondWorker.set(Thread.currentThread());
+                return slowEngine.processPayment(event, member);
+            });
+            awaitBlocked(secondWorker);
+
+            failFirstAttempt.countDown();
+
+            ExecutionException failure = assertThrows(ExecutionException.class,
+                    () -> first.get(2, TimeUnit.SECONDS));
+            assertInstanceOf(IllegalStateException.class, failure.getCause());
+            PointsResult redelivery = second.get(2, TimeUnit.SECONDS);
+            assertEquals(1500, redelivery.getPointsAwarded());
+            assertEquals(ProcessingOutcome.AWARDED, redelivery.getOutcome());
+            assertEquals(1500, member.getPointsForMonth(YearMonth.of(2026, 3)));
+        } finally {
+            executor.shutdownNow();
+        }
+    }
+
+    private static void await(CountDownLatch latch) {
+        try {
+            assertTrue(latch.await(2, TimeUnit.SECONDS));
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException(e);
+        }
+    }
+
+    private static void awaitBlocked(AtomicReference<Thread> worker) throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+        while (worker.get() == null || worker.get().getState() != Thread.State.BLOCKED) {
+            assertTrue(System.nanoTime() < deadline,
+                    "a concurrent duplicate should wait for the delivery in progress");
+            Thread.sleep(1);
         }
     }
 }
