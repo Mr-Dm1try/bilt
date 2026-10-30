@@ -255,6 +255,48 @@ class RewardsEngineTest {
         }
     }
 
+    @RepeatedTest(8)
+    void neverExceedsMonthlyCapWhenDifferentEventsArriveConcurrently() throws Exception {
+        int workerCount = 16;
+        MemberAccount member = new MemberAccount("member-1", 0);
+        ExecutorService executor = Executors.newFixedThreadPool(workerCount);
+        CountDownLatch ready = new CountDownLatch(workerCount);
+        CountDownLatch start = new CountDownLatch(1);
+
+        try {
+            List<Future<PointsResult>> futures = new ArrayList<>();
+            for (int worker = 0; worker < workerCount; worker++) {
+                PaymentEvent event = new PaymentEvent("evt-" + worker, "member-1",
+                        new BigDecimal("10000"), false, LocalDate.of(2026, 3, 1));
+                futures.add(executor.submit(() -> {
+                    ready.countDown();
+                    start.await();
+                    return engine.processPayment(event, member);
+                }));
+            }
+
+            assertTrue(ready.await(2, TimeUnit.SECONDS));
+            start.countDown();
+
+            long awarded = 0;
+            long capped = 0;
+            for (Future<PointsResult> future : futures) {
+                ProcessingOutcome outcome = future.get(2, TimeUnit.SECONDS).getOutcome();
+                if (outcome == ProcessingOutcome.AWARDED) {
+                    awarded++;
+                } else if (outcome == ProcessingOutcome.CAPPED) {
+                    capped++;
+                }
+            }
+
+            assertEquals(100_000, member.getPointsForMonth(YearMonth.of(2026, 3)));
+            assertEquals(10, awarded);
+            assertEquals(6, capped);
+        } finally {
+            executor.shutdownNow();
+        }
+    }
+
     private static void await(CountDownLatch latch) {
         try {
             assertTrue(latch.await(2, TimeUnit.SECONDS));
