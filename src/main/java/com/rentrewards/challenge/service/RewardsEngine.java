@@ -10,11 +10,12 @@ import java.time.YearMonth;
 /**
  * Orchestrates the processing of an incoming payment webhook event:
  *
- *  1. Ignore the event if it is a duplicate delivery.
+ *  1. Process each eventId at most once; duplicate deliveries (retries,
+ *     out-of-order or concurrent) are skipped as DUPLICATE.
  *  2. Calculate base points (with linked-account multiplier).
  *  3. Apply streak bonus if the member is eligible.
  *  4. Enforce the monthly points cap per member.
- *  5. Record the points and mark the event as processed.
+ *  5. Record the points.
  */
 public class RewardsEngine {
 
@@ -29,25 +30,32 @@ public class RewardsEngine {
     }
 
     public PointsResult processPayment(PaymentEvent event, MemberAccount member) {
-        if (processedEventStore.isDuplicate(event.getEventId())) {
-            return new PointsResult(member.getMemberId(), 0, ProcessingOutcome.DUPLICATE);
-        }
+        return processedEventStore.processOnce(event.getEventId(), () -> award(event, member))
+                .orElseGet(() -> new PointsResult(member.getMemberId(), 0, ProcessingOutcome.DUPLICATE));
+    }
 
+    private PointsResult award(PaymentEvent event, MemberAccount member) {
         long basePoints = pointsCalculator.calculateBasePoints(event);
         long pointsWithBonus = pointsCalculator.applyStreakBonusIfEligible(
                 basePoints, member.getCurrentStreakMonths());
 
         YearMonth month = YearMonth.from(event.getPaymentDate());
-        long alreadyEarnedThisMonth = member.getPointsForMonth(month);
-        long remainingCap = Math.max(0, MONTHLY_POINTS_CAP - alreadyEarnedThisMonth);
-        long pointsToAward = Math.min(pointsWithBonus, remainingCap);
+        // Different events for the same member can run concurrently; reading the month's
+        // total and adding to it must be one step or the member can overshoot the cap.
+        synchronized (member) {
+            long alreadyEarnedThisMonth = member.getPointsForMonth(month);
+            long remainingCap = Math.max(0, MONTHLY_POINTS_CAP - alreadyEarnedThisMonth);
+            long pointsToAward = Math.min(pointsWithBonus, remainingCap);
 
-        member.addPointsForMonth(month, pointsToAward);
-        processedEventStore.markProcessed(event.getEventId());
+            ProcessingOutcome outcome = pointsToAward == 0
+                    ? ProcessingOutcome.CAPPED
+                    : ProcessingOutcome.AWARDED;
+            PointsResult result = new PointsResult(member.getMemberId(), pointsToAward, outcome);
 
-        ProcessingOutcome outcome = pointsToAward == 0
-                ? ProcessingOutcome.CAPPED
-                : ProcessingOutcome.AWARDED;
-        return new PointsResult(member.getMemberId(), pointsToAward, outcome);
+            // Crediting must stay the last step: the event is marked processed only after
+            // award() returns, so a failure after this line would let a retry credit again.
+            member.addPointsForMonth(month, pointsToAward);
+            return result;
+        }
     }
 }

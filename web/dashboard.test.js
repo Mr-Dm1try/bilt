@@ -40,3 +40,28 @@ test("shows when the member has reached the monthly cap", () => {
   assert.equal(view.tone, "warning");
   assert.equal(view.progressPercent, 100);
 });
+
+test("does not describe skipped or capped payments as credited", () => {
+  for (const outcome of ["DUPLICATE", "CAPPED"]) {
+    const view = buildViewModel({ pointsAwarded: 0, outcome }, member);
+
+    assert.doesNotMatch(view.title, /credited/i);
+    assert.doesNotMatch(view.description, /credited|successfully/i);
+  }
+});
+
+test("explains the cap using the member's monthly limit", () => {
+  const view = buildViewModel(
+    { pointsAwarded: 0, outcome: "CAPPED" },
+    { ...member, pointsThisMonth: 100_000 },
+  );
+
+  assert.match(view.description, /100,000-point monthly maximum/);
+});
+
+test("does not guess success for an unknown outcome", () => {
+  const view = buildViewModel({ pointsAwarded: 0, outcome: "PENDING" }, member);
+
+  assert.equal(view.title, "Payment status unavailable");
+  assert.equal(view.tone, "neutral");
+});
